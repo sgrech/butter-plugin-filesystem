@@ -1,10 +1,15 @@
 """FilesystemPlugin — local filesystem access for butter-agent.
 
 A `local-write` plugin that lets the agent navigate, inspect, read,
-write, and edit files on the local disk (search/find and gated delete
-arrive in later build steps). Unlike `notes`, it owns no shared store and
-declares no `requires`: it never calls another plugin. Persistence *is*
-the filesystem.
+write, edit, and search files on the local disk (operator-gated delete
+arrives in the next build step). Unlike `notes`, it owns no shared store
+and declares no `requires`: it never calls another plugin. Persistence
+*is* the filesystem.
+
+Search delegates to `fd` / `ripgrep` when they are on PATH (fast,
+.gitignore-aware, structured output) and falls back to a pure-stdlib
+walk otherwise — the binaries are an optional speed/accuracy upgrade,
+never a packaged dependency.
 
 The plugin satisfies `butter_agent.plugin_api.Plugin` structurally. It is
 not typed against that Protocol explicitly and imports `PluginContext`
@@ -23,7 +28,12 @@ for delete, additionally gated by an operator `config` flag.
 
 from __future__ import annotations
 
+import fnmatch
+import json
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +47,50 @@ if TYPE_CHECKING:
 #: caller that needs more pages by passing an explicit larger `limit`
 #: (and `offset` to page through).
 _DEFAULT_READ_LINES: Final = 2000
+
+#: Default result caps for the search capabilities — keep a model turn
+#: bounded even on a huge tree; callers raise them with explicit `limit`.
+_DEFAULT_FIND_LIMIT: Final = 1000
+_DEFAULT_SEARCH_LIMIT: Final = 200
+
+#: External binaries used opportunistically. Absence is normal — a
+#: pure-stdlib fallback always exists; the binary is a speed/.gitignore
+#: upgrade, never a dependency.
+_FD_BIN: Final = 'fd'
+_RG_BIN: Final = 'rg'
+
+#: Subprocess wall-clock ceiling. A search that cannot finish in this
+#: long on a local tree is pathological — fail loudly rather than hang
+#: the agent turn.
+_SUBPROCESS_TIMEOUT: Final = 30.0
+
+#: Directories the stdlib fallback never descends into. ripgrep / fd get
+#: this (and full .gitignore semantics) for free; the fallback is not
+#: .gitignore-aware (documented limitation) so it at least skips the
+#: universally-noise VCS/build/cache dirs.
+_SKIP_DIRS: Final[frozenset[str]] = frozenset(
+    {
+        '.git',
+        '.hg',
+        '.svn',
+        'node_modules',
+        '__pycache__',
+        '.venv',
+        'venv',
+        '.mypy_cache',
+        '.pytest_cache',
+        '.ruff_cache',
+        '.tox',
+        '.idea',
+        'dist',
+        'build',
+    },
+)
+
+#: Fallback content scan skips files larger than this — a multi-hundred-MB
+#: blob is almost never what a text search wants and reading it stalls the
+#: turn. ripgrep applies its own binary/size heuristics.
+_MAX_SCAN_BYTES: Final = 5 * 1024 * 1024
 
 
 class FilesystemPluginError(Exception):
@@ -87,8 +141,12 @@ class FilesystemPlugin:
             return self._write_file(inputs)
         if capability == 'edit_file':
             return self._edit_file(inputs)
+        if capability == 'find_files':
+            return self._find_files(inputs)
+        if capability == 'search_content':
+            return self._search_content(inputs)
         raise FilesystemPluginError(
-            f'unknown capability {capability!r} (expected one of: pwd, cd, list_dir, stat, read_file, write_file, edit_file)',
+            f'unknown capability {capability!r} (expected one of: pwd, cd, list_dir, stat, read_file, write_file, edit_file, find_files, search_content)',
         )
 
     # --- path resolution -----------------------------------------------------
@@ -260,6 +318,154 @@ class FilesystemPlugin:
             )
         self._atomic_write(target, text.replace(old, new, 1))
         return {'path': str(target), 'replaced': 1}
+
+    # --- search --------------------------------------------------------------
+
+    def _search_base(self, inputs: dict[str, object]) -> Path:
+        """Resolve and validate the directory a search runs under."""
+        raw = inputs.get('path')
+        base = self._resolve(raw) if raw is not None else self._cwd
+        if not base.exists():
+            raise FilesystemPluginError(f'no such path: {base}')
+        if not base.is_dir():
+            raise FilesystemPluginError(f'not a directory: {base}')
+        return base
+
+    def _find_files(self, inputs: dict[str, object]) -> dict[str, object]:
+        pattern = inputs.get('pattern')
+        if not isinstance(pattern, str) or not pattern:
+            raise FilesystemPluginError(f"input 'pattern' must be a non-empty string, got {pattern!r}")
+        base = self._search_base(inputs)
+        limit = _non_negative_int(inputs.get('limit'), 'limit', default=_DEFAULT_FIND_LIMIT)
+
+        fd_bin = shutil.which(_FD_BIN)
+        if fd_bin is not None:
+            return {'paths': _fd_find(fd_bin, pattern, base, limit), 'backend': 'fd'}
+        return {'paths': _walk_find(pattern, base, limit), 'backend': 'stdlib'}
+
+    def _search_content(self, inputs: dict[str, object]) -> dict[str, object]:
+        query = inputs.get('query')
+        if not isinstance(query, str) or not query:
+            raise FilesystemPluginError(f"input 'query' must be a non-empty string, got {query!r}")
+        glob = inputs.get('glob')
+        if glob is not None and (not isinstance(glob, str) or not glob):
+            raise FilesystemPluginError(f"input 'glob' must be a non-empty string when given, got {glob!r}")
+        # Pre-compile with Python's `re` regardless of backend: it gives a
+        # single, predictable "invalid regex" error and is the matcher the
+        # stdlib fallback uses. ripgrep's regex dialect is a near-superset
+        # for the common cases the agent emits; exotic divergences are an
+        # accepted v1 limitation (documented in the README).
+        try:
+            regex = re.compile(query)
+        except re.error as exc:
+            raise FilesystemPluginError(f'invalid regular expression {query!r}: {exc}') from exc
+        base = self._search_base(inputs)
+        limit = _non_negative_int(inputs.get('limit'), 'limit', default=_DEFAULT_SEARCH_LIMIT)
+
+        rg_bin = shutil.which(_RG_BIN)
+        if rg_bin is not None:
+            return {'matches': _rg_search(rg_bin, query, glob, base, limit), 'backend': 'ripgrep'}
+        return {'matches': _walk_search(regex, glob, base, limit), 'backend': 'stdlib'}
+
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run an external search binary, mapping failure modes to plugin errors."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise FilesystemPluginError(f'{cmd[0]} timed out after {_SUBPROCESS_TIMEOUT}s') from exc
+    except OSError as exc:
+        raise FilesystemPluginError(f'failed to run {cmd[0]}: {exc}') from exc
+
+
+def _fd_find(fd_bin: str, pattern: str, base: Path, limit: int) -> list[str]:
+    """`fd` backend: glob match, files only, absolute, NUL-delimited."""
+    result = _run(
+        [fd_bin, '--glob', '--type', 'f', '--absolute-path', '--color', 'never', '--print0', pattern, str(base)],
+    )
+    if result.returncode != 0:
+        raise FilesystemPluginError(f'fd failed (exit {result.returncode}): {result.stderr.strip()}')
+    paths = sorted(p for p in result.stdout.split('\0') if p)
+    return paths[:limit]
+
+
+def _walk_find(pattern: str, base: Path, limit: int) -> list[str]:
+    """Stdlib fallback for `find_files` — os.walk + fnmatch on the name."""
+    out: list[str] = []
+    for root, dirs, files in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
+        for name in sorted(files):
+            if fnmatch.fnmatch(name, pattern):
+                out.append(str(Path(root) / name))
+    return out[:limit]
+
+
+def _rg_search(rg_bin: str, query: str, glob: object, base: Path, limit: int) -> list[dict[str, object]]:
+    """`ripgrep` backend: parse `--json` events into {path, line, text}."""
+    if limit <= 0:
+        return []
+    cmd = [rg_bin, '--json', '--color', 'never']
+    if isinstance(glob, str):
+        cmd += ['--glob', glob]
+    cmd += ['--', query, str(base)]
+    result = _run(cmd)
+    # ripgrep: 0 = matches, 1 = no matches (not an error), 2 = real error.
+    if result.returncode == 1:
+        return []
+    if result.returncode != 0:
+        raise FilesystemPluginError(f'ripgrep failed (exit {result.returncode}): {result.stderr.strip()}')
+
+    matches: list[dict[str, object]] = []
+    for raw_line in result.stdout.splitlines():
+        if not raw_line:
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get('type') != 'match':
+            continue
+        data = event.get('data', {})
+        path_text = data.get('path', {}).get('text')
+        line_no = data.get('line_number')
+        text = data.get('lines', {}).get('text', '')
+        if not isinstance(path_text, str) or not isinstance(line_no, int):
+            continue
+        matches.append({'path': path_text, 'line': line_no, 'text': str(text).rstrip('\n')})
+        if len(matches) >= limit:
+            break
+    return matches
+
+
+def _walk_search(regex: re.Pattern[str], glob: object, base: Path, limit: int) -> list[dict[str, object]]:
+    """Stdlib fallback for `search_content` — walk + per-line regex scan.
+
+    Not .gitignore-aware (only `_SKIP_DIRS` are pruned); skips files over
+    `_MAX_SCAN_BYTES` and any that are not UTF-8 decodable.
+    """
+    if limit <= 0:
+        return []
+    matches: list[dict[str, object]] = []
+    for root, dirs, files in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
+        for name in sorted(files):
+            if isinstance(glob, str) and not fnmatch.fnmatch(name, glob):
+                continue
+            fpath = Path(root) / name
+            try:
+                if fpath.stat().st_size > _MAX_SCAN_BYTES:
+                    continue
+                with fpath.open(encoding='utf-8') as handle:
+                    for line_no, line in enumerate(handle, start=1):
+                        if regex.search(line):
+                            matches.append({'path': str(fpath), 'line': line_no, 'text': line.rstrip('\n')})
+                            if len(matches) >= limit:
+                                return matches
+            except (UnicodeDecodeError, OSError):
+                # Binary / unreadable file — skip, consistent with how
+                # ripgrep silently ignores non-text files.
+                continue
+    return matches
 
 
 def _non_negative_int(value: object, key: str, *, default: int) -> int:

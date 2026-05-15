@@ -19,6 +19,7 @@ suite, not here.
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -292,6 +293,118 @@ async def test_edit_file_rejects_invalid_old(tmp_path: Path, bad: object) -> Non
         await plugin.execute('edit_file', {'path': str(target), 'old': bad, 'new': 'x'}, FakePluginContext())
 
 
+# --- find_files / search_content ---------------------------------------------
+
+
+def _force_stdlib(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the plugin take its pure-stdlib path regardless of host PATH."""
+    monkeypatch.setattr('butter_plugin_filesystem.plugin.shutil.which', lambda _name: None)
+
+
+@pytest.fixture
+def tree(tmp_path: Path) -> Path:
+    """A small project tree with a known NEEDLE token and noise dirs."""
+    proj = tmp_path / 'proj'
+    (proj / 'sub').mkdir(parents=True)
+    (proj / 'a.py').write_text('import os\nNEEDLE = 1\n')
+    (proj / 'sub' / 'b.txt').write_text('hello NEEDLE world\n')
+    (proj / 'c.md').write_text('no token here\n')
+    # Noise the stdlib fallback must prune.
+    (proj / '.git').mkdir()
+    (proj / '.git' / 'ignored.py').write_text('NEEDLE in vcs\n')
+    (proj / 'b.bin').write_bytes(b'\xff\xfeNEEDLE')
+    return proj
+
+
+def _paths(result: dict[str, object]) -> list[str]:
+    value = result['paths']
+    assert isinstance(value, list)
+    return [str(p) for p in value]
+
+
+def _matches(result: dict[str, object]) -> list[dict[str, object]]:
+    value = result['matches']
+    assert isinstance(value, list)
+    for m in value:
+        assert isinstance(m, dict)
+    return value
+
+
+async def test_find_files_stdlib_globs_and_prunes_noise(tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_stdlib(monkeypatch)
+    plugin = FilesystemPlugin()
+    result = await plugin.execute('find_files', {'pattern': '*.py', 'path': str(tree)}, FakePluginContext())
+    assert result['backend'] == 'stdlib'
+    names = {Path(p).name for p in _paths(result)}
+    assert names == {'a.py'}  # .git/ignored.py pruned by _SKIP_DIRS
+
+
+async def test_find_files_stdlib_limit_caps_results(tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_stdlib(monkeypatch)
+    plugin = FilesystemPlugin()
+    result = await plugin.execute('find_files', {'pattern': '*', 'path': str(tree), 'limit': 2}, FakePluginContext())
+    assert len(_paths(result)) == 2
+
+
+@pytest.mark.parametrize('bad', ['', None, 5])
+async def test_find_files_rejects_bad_pattern(bad: object) -> None:
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match="'pattern' must be a non-empty string"):
+        await plugin.execute('find_files', {'pattern': bad}, FakePluginContext())
+
+
+async def test_search_content_stdlib_finds_token_with_location(tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_stdlib(monkeypatch)
+    plugin = FilesystemPlugin()
+    result = await plugin.execute('search_content', {'query': 'NEEDLE', 'path': str(tree)}, FakePluginContext())
+    assert result['backend'] == 'stdlib'
+    hits = {(Path(str(m['path'])).name, m['line'], m['text']) for m in _matches(result)}
+    # a.py:2 and sub/b.txt:1 — .git pruned, b.bin skipped (non-UTF-8).
+    assert hits == {('a.py', 2, 'NEEDLE = 1'), ('b.txt', 1, 'hello NEEDLE world')}
+
+
+async def test_search_content_stdlib_glob_filters_files(tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_stdlib(monkeypatch)
+    plugin = FilesystemPlugin()
+    result = await plugin.execute('search_content', {'query': 'NEEDLE', 'path': str(tree), 'glob': '*.py'}, FakePluginContext())
+    assert {Path(str(m['path'])).name for m in _matches(result)} == {'a.py'}
+
+
+async def test_search_content_rejects_invalid_regex(tree: Path) -> None:
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='invalid regular expression'):
+        await plugin.execute('search_content', {'query': '(', 'path': str(tree)}, FakePluginContext())
+
+
+@pytest.mark.parametrize('bad', ['', None, 9])
+async def test_search_content_rejects_bad_query(bad: object) -> None:
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match="'query' must be a non-empty string"):
+        await plugin.execute('search_content', {'query': bad}, FakePluginContext())
+
+
+async def test_search_content_rejects_missing_directory(tmp_path: Path) -> None:
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='no such path'):
+        await plugin.execute('search_content', {'query': 'x', 'path': str(tmp_path / 'ghost')}, FakePluginContext())
+
+
+@pytest.mark.skipif(shutil.which('rg') is None, reason='ripgrep not installed')
+async def test_search_content_ripgrep_backend_when_present(tree: Path) -> None:
+    plugin = FilesystemPlugin()
+    result = await plugin.execute('search_content', {'query': 'NEEDLE', 'path': str(tree), 'glob': '*.py'}, FakePluginContext())
+    assert result['backend'] == 'ripgrep'
+    assert {Path(str(m['path'])).name for m in _matches(result)} == {'a.py'}
+
+
+@pytest.mark.skipif(shutil.which('fd') is None, reason='fd not installed')
+async def test_find_files_fd_backend_when_present(tree: Path) -> None:
+    plugin = FilesystemPlugin()
+    result = await plugin.execute('find_files', {'pattern': '*.py', 'path': str(tree)}, FakePluginContext())
+    assert result['backend'] == 'fd'
+    assert 'a.py' in {Path(p).name for p in _paths(result)}
+
+
 # --- dispatch ----------------------------------------------------------------
 
 
@@ -309,7 +422,7 @@ def test_manifest_round_trips_through_butter_validator() -> None:
     assert manifest.name == 'filesystem'
     assert manifest.blast_radius is BlastRadius.LOCAL_WRITE
     assert manifest.entrypoint == 'butter_plugin_filesystem:FilesystemPlugin'
-    assert {cap.name for cap in manifest.capabilities} == {'pwd', 'cd', 'list_dir', 'stat', 'read_file', 'write_file', 'edit_file'}
+    assert {cap.name for cap in manifest.capabilities} == {'pwd', 'cd', 'list_dir', 'stat', 'read_file', 'write_file', 'edit_file', 'find_files', 'search_content'}
     # All user-facing — they appear in the planner menu.
     assert all(not cap.internal for cap in manifest.capabilities)
     # Filesystem-backed, not database-backed: it calls no other plugin.

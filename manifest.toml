@@ -72,3 +72,15 @@ name = "edit_file"
 description = "Replace an exact substring in the UTF-8 text file at `path`. `old` must occur EXACTLY ONCE in the file (fails if it is absent or appears more than once — make `old` long enough to be unique by including surrounding context); it is replaced with `new` (which may be empty to delete the text). The file is rewritten atomically. Destructive — the planner should gate this `confirm`."
 input_schema = { path = "string", old = "string", new = "string" }
 output_schema = { path = "string", replaced = "integer" }
+
+[[capability]]
+name = "find_files"
+description = "Find files by name using a glob `pattern` (e.g. `*.py`, `test_*`). Optional `path` is the directory to search (absolute or relative to cwd; defaults to cwd) and `limit` caps results. Uses `fd` when available (.gitignore-aware), else a stdlib directory walk (skips .git and common build/VCS dirs). Returns absolute paths."
+input_schema = { pattern = "string" }
+output_schema = { paths = "array", backend = "string" }
+
+[[capability]]
+name = "search_content"
+description = "Search file contents for `query` (a regular expression), grep-style. Optional `path` is the directory to search (defaults to cwd), `glob` filters which files by name (e.g. `*.py`), and `limit` caps the number of matching lines. Uses `ripgrep` when available (.gitignore-aware), else a stdlib walk + regex scan. Returns matches as {path, line, text}."
+input_schema = { query = "string" }
+output_schema = { matches = "array", backend = "string" }
