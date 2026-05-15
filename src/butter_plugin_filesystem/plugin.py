@@ -1,15 +1,24 @@
 """FilesystemPlugin — local filesystem access for butter-agent.
 
 A `local-write` plugin that lets the agent navigate, inspect, read,
-write, edit, and search files on the local disk (operator-gated delete
-arrives in the next build step). Unlike `notes`, it owns no shared store
-and declares no `requires`: it never calls another plugin. Persistence
-*is* the filesystem.
+write, edit, search, and (operator-gated) delete files on the local
+disk. Unlike `notes`, it owns no shared store and declares no
+`requires`: it never calls another plugin. Persistence *is* the
+filesystem.
 
 Search delegates to `fd` / `ripgrep` when they are on PATH (fast,
 .gitignore-aware, structured output) and falls back to a pure-stdlib
 walk otherwise — the binaries are an optional speed/accuracy upgrade,
 never a packaged dependency.
+
+`delete` is the one capability with teeth and the reference for the
+operator-config gate: it refuses unless the operator set
+`allow_delete = true` (read via the host's model-invisible
+`PluginContext.config`), additionally requires `allow_recursive_delete`
++ an explicit `recursive` input for a non-empty directory, supports a
+non-mutating `dry_run` preview, unconditionally refuses blast-radius
+catastrophes (fs root, `$HOME`, the cwd or their ancestors), and moves
+to a recoverable `.butter-trash/` rather than hard-deleting by default.
 
 The plugin satisfies `butter_agent.plugin_api.Plugin` structurally. It is
 not typed against that Protocol explicitly and imports `PluginContext`
@@ -21,9 +30,9 @@ Working-directory model: the plugin holds a mutable `_cwd` (the process
 CWD at construction). The model moves it explicitly via the `cd`
 capability; every other capability resolves a relative `path` against it.
 There is deliberately no root jail — the operator, not a path prefix,
-draws the boundary. Containment lives entirely on the destructive side
-(write/edit/delete, added in later steps): those are planner-gated and,
-for delete, additionally gated by an operator `config` flag.
+draws the boundary. Containment lives entirely on the destructive side:
+write/edit are planner-gated; delete is additionally operator-gated via
+`config` and has unconditional protected-path backstops.
 """
 
 from __future__ import annotations
@@ -92,6 +101,17 @@ _SKIP_DIRS: Final[frozenset[str]] = frozenset(
 #: turn. ripgrep applies its own binary/size heuristics.
 _MAX_SCAN_BYTES: Final = 5 * 1024 * 1024
 
+#: Recoverable-delete directory. A deleted target is moved into one of
+#: these at its own parent (same filesystem, so the move is a rename),
+#: timestamped to avoid collisions. The operator empties it manually.
+_TRASH_DIRNAME: Final = '.butter-trash'
+
+#: A path with this few components is a filesystem root or a top-level
+#: system directory (`/`, `/Users`, `/etc`, `/home`). `delete` refuses
+#: anything at or below this depth regardless of other flags — the
+#: blast-radius backstop against a catastrophic recursive wipe.
+_MIN_DELETE_PARTS: Final = 3
+
 
 class FilesystemPluginError(Exception):
     """Raised on any malformed or refused `filesystem.*` call.
@@ -100,8 +120,8 @@ class FilesystemPluginError(Exception):
     its broad plugin-failure path and records it as the step's
     `failure_reason` (a plugin may raise for any reason and must not tear
     the loop down). Used for input-validation failures, missing paths,
-    wrong path types, binary reads, and (in later build steps) refused
-    destructive operations.
+    wrong path types, binary reads, and refused destructive operations
+    (delete disabled, recursion not permitted, protected path).
     """
 
 
@@ -123,9 +143,13 @@ class FilesystemPlugin:
         inputs: dict[str, object],
         context: PluginContext,
     ) -> dict[str, object]:
-        # `context` is unused for read/navigate capabilities — they touch
-        # only the local filesystem and call no other plugin. It is read
-        # in later build steps (delete consults `context.config`).
+        # `delete` is the only capability that consults the host —
+        # specifically `context.config` for the operator's destructive
+        # opt-in (model-invisible by design). Handle it before `context`
+        # is dropped; every other capability touches only the local
+        # filesystem and calls no other plugin.
+        if capability == 'delete':
+            return self._delete(inputs, context)
         del context
         if capability == 'pwd':
             return self._pwd()
@@ -146,7 +170,7 @@ class FilesystemPlugin:
         if capability == 'search_content':
             return self._search_content(inputs)
         raise FilesystemPluginError(
-            f'unknown capability {capability!r} (expected one of: pwd, cd, list_dir, stat, read_file, write_file, edit_file, find_files, search_content)',
+            f'unknown capability {capability!r} (expected one of: pwd, cd, list_dir, stat, read_file, write_file, edit_file, find_files, search_content, delete)',
         )
 
     # --- path resolution -----------------------------------------------------
@@ -167,6 +191,22 @@ class FilesystemPlugin:
         if not candidate.is_absolute():
             candidate = self._cwd / candidate
         return candidate.resolve()
+
+    def _resolve_unfollowed(self, raw: object, *, key: str = 'path') -> Path:
+        """Like `_resolve`, but never follows a *final* symlink.
+
+        Delete must act on the path the caller named, not whatever it
+        points at — resolving a symlink and then deleting would remove
+        the link's target (a silent, dangerous escape). Intermediate
+        symlinks in the parent chain are still resolved so the
+        protected-path checks see a real location.
+        """
+        if not isinstance(raw, str) or not raw:
+            raise FilesystemPluginError(f'input {key!r} must be a non-empty string, got {raw!r}')
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._cwd / candidate
+        return candidate.parent.resolve() / candidate.name
 
     @staticmethod
     def _kind(path: Path) -> str:
@@ -367,6 +407,129 @@ class FilesystemPlugin:
             return {'matches': _rg_search(rg_bin, query, glob, base, limit), 'backend': 'ripgrep'}
         return {'matches': _walk_search(regex, glob, base, limit), 'backend': 'stdlib'}
 
+    # --- delete --------------------------------------------------------------
+
+    @staticmethod
+    def _flag(context: PluginContext, key: str) -> bool:
+        """Read a strict boolean opt-in from the operator's plugin config.
+
+        Only an explicit `true` counts — a missing key, a non-bool, or
+        any other value is off. The model cannot influence this:
+        `context.config` is operator-declared and surfaced read-only by
+        the host (butter-agent >= v0.1.0). This is the gate that makes
+        `delete` an operator decision, not a model one.
+        """
+        return context.config.get(key) is True
+
+    def _assert_not_protected(self, target: Path) -> None:
+        """Refuse blast-radius-catastrophic targets, flags notwithstanding.
+
+        These checks are unconditional — no input or config value can
+        re-enable them. They are the backstop against an `rm -rf /`-class
+        mistake: the filesystem root and top-level system dirs (too few
+        path components), `$HOME` or any ancestor of it, the working
+        directory or any ancestor of it, and the trash dir itself.
+        """
+        real = target.resolve()
+        if len(real.parts) < _MIN_DELETE_PARTS:
+            raise FilesystemPluginError(f'refusing to delete {real}: filesystem root or top-level system path')
+        home = Path.home().resolve()
+        if real == home or real in home.parents:
+            raise FilesystemPluginError(f'refusing to delete {real}: it is your home directory or an ancestor of it')
+        cwd = self._cwd.resolve()
+        if real == cwd or real in cwd.parents:
+            raise FilesystemPluginError(f'refusing to delete {real}: it is the working directory or an ancestor of it')
+        if real.name == _TRASH_DIRNAME:
+            raise FilesystemPluginError(f'refusing to delete the trash directory itself: {real}')
+
+    def _trash(self, target: Path) -> None:
+        """Move `target` into a `.butter-trash/` beside it (recoverable).
+
+        The trash dir lives at `target.parent`, so the move is a rename
+        within one filesystem (atomic, no copy). A UTC timestamp suffix
+        keeps repeated deletes of the same name from colliding.
+        """
+        trash_dir = target.parent / _TRASH_DIRNAME
+        stamp = datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%S%f')
+        try:
+            trash_dir.mkdir(exist_ok=True)
+            shutil.move(str(target), str(trash_dir / f'{target.name}.{stamp}'))
+        except OSError as exc:
+            raise FilesystemPluginError(f'failed to move {target} to trash: {exc}') from exc
+
+    @staticmethod
+    def _hard_delete(target: Path, *, is_dir: bool) -> None:
+        try:
+            if is_dir:
+                shutil.rmtree(target)
+            else:
+                # A symlink reaches here (is_dir is False for links):
+                # unlink removes the link, never its target.
+                target.unlink()
+        except OSError as exc:
+            raise FilesystemPluginError(f'failed to delete {target}: {exc}') from exc
+
+    def _delete(self, inputs: dict[str, object], context: PluginContext) -> dict[str, object]:
+        if not self._flag(context, 'allow_delete'):
+            raise FilesystemPluginError(
+                "delete is disabled: the operator has not set allow_delete = true in this plugin's config",
+            )
+        target = self._resolve_unfollowed(inputs.get('path'))
+        recursive = _opt_bool(inputs.get('recursive'), 'recursive')
+        dry_run = _opt_bool(inputs.get('dry_run'), 'dry_run')
+
+        # A broken symlink doesn't `exist()` but is still a real thing to
+        # remove — accept it if the path is a symlink either way.
+        if not target.exists() and not target.is_symlink():
+            raise FilesystemPluginError(f'no such path: {target}')
+        self._assert_not_protected(target)
+
+        is_symlink = target.is_symlink()
+        is_dir = target.is_dir() and not is_symlink
+        entry_count = sum(1 for _ in target.iterdir()) if is_dir else 0
+        if is_dir and entry_count > 0:
+            # The two-key lock on `rm -rf`: the model must explicitly ask
+            # for recursion AND the operator must have allowed it. Either
+            # missing => refuse.
+            if not recursive:
+                raise FilesystemPluginError(
+                    f'{target} is a non-empty directory ({entry_count} entries); pass recursive=true to delete it',
+                )
+            if not self._flag(context, 'allow_recursive_delete'):
+                raise FilesystemPluginError(
+                    f'recursive delete of {target} refused: the operator has not set allow_recursive_delete = true',
+                )
+
+        # Hard delete only when the operator opted into it; otherwise the
+        # target is recoverable from trash (scope decision B3.5).
+        hard = self._flag(context, 'allow_recursive_delete')
+        recursive_effective = bool(is_dir and entry_count > 0)
+
+        if dry_run:
+            # The verification preview: every safety check above has run,
+            # nothing was mutated. The planner chains this before the
+            # `human`-gated real delete so the operator sees the resolved
+            # absolute target and its scale.
+            return {
+                'path': str(target),
+                'dry_run': True,
+                'trashed': not hard,
+                'recursive': recursive_effective,
+                'is_dir': is_dir,
+                'entries': entry_count,
+            }
+
+        if hard:
+            self._hard_delete(target, is_dir=is_dir)
+        else:
+            self._trash(target)
+        return {
+            'path': str(target),
+            'dry_run': False,
+            'trashed': not hard,
+            'recursive': recursive_effective,
+        }
+
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     """Run an external search binary, mapping failure modes to plugin errors."""
@@ -479,4 +642,18 @@ def _non_negative_int(value: object, key: str, *, default: int) -> int:
         return default
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise FilesystemPluginError(f'input {key!r} must be a non-negative integer, got {value!r}')
+    return value
+
+
+def _opt_bool(value: object, key: str) -> bool:
+    """Coerce an optional boolean input — absent is False, non-bool errors.
+
+    Distinct from the operator-config flags (`_flag`): this validates a
+    *model-supplied* plan input (`recursive`, `dry_run`) and rejects a
+    wrong type loudly rather than silently coercing it.
+    """
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise FilesystemPluginError(f'input {key!r} must be a boolean when given, got {value!r}')
     return value

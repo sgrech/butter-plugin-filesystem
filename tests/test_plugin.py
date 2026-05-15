@@ -405,6 +405,158 @@ async def test_find_files_fd_backend_when_present(tree: Path) -> None:
     assert 'a.py' in {Path(p).name for p in _paths(result)}
 
 
+# --- delete ------------------------------------------------------------------
+
+
+def _allow(**flags: bool) -> FakePluginContext:
+    """A context carrying operator delete flags (model-invisible config)."""
+    return FakePluginContext(config=dict(flags))
+
+
+def _trash_contents(parent: Path) -> list[str]:
+    trash = parent / '.butter-trash'
+    return [p.name for p in trash.iterdir()] if trash.is_dir() else []
+
+
+async def test_delete_disabled_without_operator_flag(tmp_path: Path) -> None:
+    f = tmp_path / 'a.txt'
+    f.write_text('x')
+    plugin = FilesystemPlugin()
+    # Default context: no allow_delete → refused, file untouched.
+    with pytest.raises(FilesystemPluginError, match='delete is disabled'):
+        await plugin.execute('delete', {'path': str(f)}, FakePluginContext())
+    assert f.exists()
+
+
+async def test_delete_file_moves_to_trash_by_default(tmp_path: Path) -> None:
+    f = tmp_path / 'a.txt'
+    f.write_text('bye')
+    plugin = FilesystemPlugin()
+    result = await plugin.execute('delete', {'path': str(f)}, _allow(allow_delete=True))
+    assert result == {'path': str(f.resolve()), 'dry_run': False, 'trashed': True, 'recursive': False}
+    assert not f.exists()
+    recovered = _trash_contents(tmp_path)
+    assert len(recovered) == 1 and recovered[0].startswith('a.txt.')
+
+
+async def test_delete_empty_directory_trashed(tmp_path: Path) -> None:
+    d = tmp_path / 'empty'
+    d.mkdir()
+    plugin = FilesystemPlugin()
+    result = await plugin.execute('delete', {'path': str(d)}, _allow(allow_delete=True))
+    assert result['trashed'] is True
+    assert not d.exists()
+
+
+async def test_delete_nonempty_dir_refused_without_recursive(tmp_path: Path) -> None:
+    d = tmp_path / 'full'
+    (d / 'sub').mkdir(parents=True)
+    (d / 'f.txt').write_text('x')
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='non-empty directory'):
+        await plugin.execute('delete', {'path': str(d)}, _allow(allow_delete=True))
+    assert d.exists()
+
+
+async def test_delete_nonempty_dir_refused_without_operator_recursive_flag(tmp_path: Path) -> None:
+    d = tmp_path / 'full'
+    d.mkdir()
+    (d / 'f.txt').write_text('x')
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='allow_recursive_delete'):
+        await plugin.execute('delete', {'path': str(d), 'recursive': True}, _allow(allow_delete=True))
+    assert d.exists()
+
+
+async def test_delete_recursive_hard_deletes_with_both_flags(tmp_path: Path) -> None:
+    d = tmp_path / 'full'
+    (d / 'sub').mkdir(parents=True)
+    (d / 'sub' / 'f.txt').write_text('x')
+    plugin = FilesystemPlugin()
+    ctx = _allow(allow_delete=True, allow_recursive_delete=True)
+    result = await plugin.execute('delete', {'path': str(d), 'recursive': True}, ctx)
+    assert result == {'path': str(d.resolve()), 'dry_run': False, 'trashed': False, 'recursive': True}
+    assert not d.exists()
+    # Hard delete (operator opted in) — not parked in trash.
+    assert _trash_contents(tmp_path) == []
+
+
+async def test_delete_dry_run_previews_without_mutating(tmp_path: Path) -> None:
+    d = tmp_path / 'full'
+    d.mkdir()
+    (d / 'a').write_text('1')
+    (d / 'b').write_text('2')
+    plugin = FilesystemPlugin()
+    result = await plugin.execute(
+        'delete',
+        {'path': str(d), 'recursive': True, 'dry_run': True},
+        _allow(allow_delete=True, allow_recursive_delete=True),
+    )
+    assert result['dry_run'] is True
+    assert result['is_dir'] is True
+    assert result['entries'] == 2
+    assert result['recursive'] is True
+    assert d.exists()  # nothing mutated
+    assert _trash_contents(tmp_path) == []
+
+
+async def test_delete_refuses_working_directory(tmp_path: Path) -> None:
+    d = tmp_path / 'proj'
+    d.mkdir()
+    plugin = FilesystemPlugin()
+    await plugin.execute('cd', {'path': str(d)}, FakePluginContext())
+    with pytest.raises(FilesystemPluginError, match='working directory or an ancestor'):
+        await plugin.execute('delete', {'path': str(d)}, _allow(allow_delete=True, allow_recursive_delete=True))
+    assert d.exists()
+
+
+async def test_delete_refuses_ancestor_of_cwd(tmp_path: Path) -> None:
+    d = tmp_path / 'proj'
+    d.mkdir()
+    plugin = FilesystemPlugin()
+    await plugin.execute('cd', {'path': str(d)}, FakePluginContext())
+    with pytest.raises(FilesystemPluginError, match='working directory or an ancestor'):
+        await plugin.execute('delete', {'path': str(tmp_path)}, _allow(allow_delete=True, allow_recursive_delete=True))
+
+
+async def test_delete_refuses_home_directory() -> None:
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='home directory or an ancestor'):
+        await plugin.execute('delete', {'path': str(Path.home())}, _allow(allow_delete=True, allow_recursive_delete=True))
+
+
+async def test_delete_refuses_shallow_system_path() -> None:
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='filesystem root or top-level system path'):
+        await plugin.execute('delete', {'path': '/usr'}, _allow(allow_delete=True, allow_recursive_delete=True))
+
+
+async def test_delete_symlink_does_not_touch_its_target(tmp_path: Path) -> None:
+    real_dir = tmp_path / 'real'
+    (real_dir / 'keep.txt').mkdir(parents=True)
+    link = tmp_path / 'link'
+    link.symlink_to(real_dir, target_is_directory=True)
+    plugin = FilesystemPlugin()
+    await plugin.execute('delete', {'path': str(link)}, _allow(allow_delete=True))
+    assert not link.exists()  # the link is gone
+    assert real_dir.is_dir()  # its target is untouched
+
+
+async def test_delete_missing_path_raises(tmp_path: Path) -> None:
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='no such path'):
+        await plugin.execute('delete', {'path': str(tmp_path / 'ghost')}, _allow(allow_delete=True))
+
+
+@pytest.mark.parametrize('bad', [1, 'yes', []])
+async def test_delete_rejects_non_bool_recursive(tmp_path: Path, bad: object) -> None:
+    f = tmp_path / 'a.txt'
+    f.write_text('x')
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match="'recursive' must be a boolean"):
+        await plugin.execute('delete', {'path': str(f), 'recursive': bad}, _allow(allow_delete=True))
+
+
 # --- dispatch ----------------------------------------------------------------
 
 
@@ -422,7 +574,7 @@ def test_manifest_round_trips_through_butter_validator() -> None:
     assert manifest.name == 'filesystem'
     assert manifest.blast_radius is BlastRadius.LOCAL_WRITE
     assert manifest.entrypoint == 'butter_plugin_filesystem:FilesystemPlugin'
-    assert {cap.name for cap in manifest.capabilities} == {'pwd', 'cd', 'list_dir', 'stat', 'read_file', 'write_file', 'edit_file', 'find_files', 'search_content'}
+    assert {cap.name for cap in manifest.capabilities} == {'pwd', 'cd', 'list_dir', 'stat', 'read_file', 'write_file', 'edit_file', 'find_files', 'search_content', 'delete'}
     # All user-facing — they appear in the planner menu.
     assert all(not cap.internal for cap in manifest.capabilities)
     # Filesystem-backed, not database-backed: it calls no other plugin.

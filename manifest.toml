@@ -84,3 +84,9 @@ name = "search_content"
 description = "Search file contents for `query` (a regular expression), grep-style. Optional `path` is the directory to search (defaults to cwd), `glob` filters which files by name (e.g. `*.py`), and `limit` caps the number of matching lines. Uses `ripgrep` when available (.gitignore-aware), else a stdlib walk + regex scan. Returns matches as {path, line, text}."
 input_schema = { query = "string" }
 output_schema = { matches = "array", backend = "string" }
+
+[[capability]]
+name = "delete"
+description = "Delete the file or directory at `path`. DISABLED unless the operator set `allow_delete = true` in this plugin's config (the model cannot enable it). Pass `dry_run: true` to preview the resolved absolute target and entry count WITHOUT deleting — chain this before the real delete. The planner MUST gate the real delete `human` so the operator sees the resolved target first. A non-empty directory needs BOTH `recursive: true` and the operator's `allow_recursive_delete = true`. Refuses protected paths (filesystem root, home, the working dir or its ancestors, shallow system paths). By default the target is moved to a `.butter-trash/` (recoverable), not hard-deleted."
+input_schema = { path = "string" }
+output_schema = { path = "string", trashed = "boolean", recursive = "boolean", dry_run = "boolean" }
