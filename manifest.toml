@@ -60,3 +60,15 @@ name = "read_file"
 description = "Read a UTF-8 text file at `path` (absolute or relative to cwd). Optional `offset` (0-based start line) and `limit` (max lines) read a slice of large files. Reports whether the returned content was truncated. Fails on a non-UTF-8 (binary) file."
 input_schema = { path = "string" }
 output_schema = { path = "string", content = "string", lines = "integer", truncated = "boolean" }
+
+[[capability]]
+name = "write_file"
+description = "Create or overwrite the file at `path` (absolute or relative to cwd) with `content`, written atomically (a sibling temp file is renamed into place, so a reader never sees a half-written file). The parent directory must already exist; the target must not be an existing directory. Destructive — the planner should gate this `confirm`."
+input_schema = { path = "string", content = "string" }
+output_schema = { path = "string", bytes_written = "integer" }
+
+[[capability]]
+name = "edit_file"
+description = "Replace an exact substring in the UTF-8 text file at `path`. `old` must occur EXACTLY ONCE in the file (fails if it is absent or appears more than once — make `old` long enough to be unique by including surrounding context); it is replaced with `new` (which may be empty to delete the text). The file is rewritten atomically. Destructive — the planner should gate this `confirm`."
+input_schema = { path = "string", old = "string", new = "string" }
+output_schema = { path = "string", replaced = "integer" }

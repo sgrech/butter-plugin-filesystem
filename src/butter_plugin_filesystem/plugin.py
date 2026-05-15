@@ -1,10 +1,10 @@
 """FilesystemPlugin — local filesystem access for butter-agent.
 
-A `local-write` plugin that lets the agent navigate, inspect, and read
-files on the local disk (write / edit / delete arrive in later build
-steps). Unlike `notes`, it owns no shared store and declares no
-`requires`: it never calls another plugin. Persistence *is* the
-filesystem.
+A `local-write` plugin that lets the agent navigate, inspect, read,
+write, and edit files on the local disk (search/find and gated delete
+arrive in later build steps). Unlike `notes`, it owns no shared store and
+declares no `requires`: it never calls another plugin. Persistence *is*
+the filesystem.
 
 The plugin satisfies `butter_agent.plugin_api.Plugin` structurally. It is
 not typed against that Protocol explicitly and imports `PluginContext`
@@ -23,6 +23,8 @@ for delete, additionally gated by an operator `config` flag.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -81,8 +83,12 @@ class FilesystemPlugin:
             return self._stat(inputs)
         if capability == 'read_file':
             return self._read_file(inputs)
+        if capability == 'write_file':
+            return self._write_file(inputs)
+        if capability == 'edit_file':
+            return self._edit_file(inputs)
         raise FilesystemPluginError(
-            f'unknown capability {capability!r} (expected one of: pwd, cd, list_dir, stat, read_file)',
+            f'unknown capability {capability!r} (expected one of: pwd, cd, list_dir, stat, read_file, write_file, edit_file)',
         )
 
     # --- path resolution -----------------------------------------------------
@@ -157,6 +163,43 @@ class FilesystemPlugin:
             'mtime': mtime,
         }
 
+    @staticmethod
+    def _read_text(target: Path) -> str:
+        """Read a path as UTF-8, raising the binary-file error on failure.
+
+        Shared by `read_file` and `edit_file` so both reject a non-UTF-8
+        file identically rather than one corrupting it on write-back.
+        """
+        try:
+            return target.read_text(encoding='utf-8')
+        except UnicodeDecodeError as exc:
+            raise FilesystemPluginError(f'not a UTF-8 text file: {target}') from exc
+
+    @staticmethod
+    def _atomic_write(target: Path, content: str) -> int:
+        """Write `content` to `target` atomically; return bytes written.
+
+        A sibling temp file in the *same directory* is written, flushed,
+        fsync'd, then `os.replace`'d over the target — `os.replace` is
+        atomic within a filesystem, so a concurrent reader sees either the
+        old file or the new one, never a truncated mix. The temp file is
+        cleaned up if anything fails before the rename.
+        """
+        data = content.encode('utf-8')
+        directory = target.parent
+        fd, tmp_name = tempfile.mkstemp(prefix=f'.{target.name}.', suffix='.tmp', dir=directory)
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, target)
+        except OSError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise FilesystemPluginError(f'failed to write {target}: {exc}') from exc
+        return len(data)
+
     def _read_file(self, inputs: dict[str, object]) -> dict[str, object]:
         target = self._resolve(inputs.get('path'))
         if not target.exists():
@@ -167,11 +210,7 @@ class FilesystemPlugin:
         offset = _non_negative_int(inputs.get('offset'), 'offset', default=0)
         limit = _non_negative_int(inputs.get('limit'), 'limit', default=_DEFAULT_READ_LINES)
 
-        try:
-            text = target.read_text(encoding='utf-8')
-        except UnicodeDecodeError as exc:
-            raise FilesystemPluginError(f'not a UTF-8 text file: {target}') from exc
-
+        text = self._read_text(target)
         all_lines = text.splitlines(keepends=True)
         window = all_lines[offset : offset + limit]
         truncated = offset > 0 or len(window) < len(all_lines)
@@ -181,6 +220,46 @@ class FilesystemPlugin:
             'lines': len(window),
             'truncated': truncated,
         }
+
+    def _write_file(self, inputs: dict[str, object]) -> dict[str, object]:
+        target = self._resolve(inputs.get('path'))
+        content = inputs.get('content')
+        if not isinstance(content, str):
+            raise FilesystemPluginError(f"input 'content' must be a string, got {content!r}")
+        if target.is_dir():
+            raise FilesystemPluginError(f'is a directory, refusing to overwrite: {target}')
+        if not target.parent.is_dir():
+            # Creating intermediate directories is a separate, explicit
+            # concern — keep write predictable and fail loudly rather
+            # than silently materialising a tree.
+            raise FilesystemPluginError(f'parent directory does not exist: {target.parent}')
+        bytes_written = self._atomic_write(target, content)
+        return {'path': str(target), 'bytes_written': bytes_written}
+
+    def _edit_file(self, inputs: dict[str, object]) -> dict[str, object]:
+        target = self._resolve(inputs.get('path'))
+        old = inputs.get('old')
+        new = inputs.get('new')
+        if not isinstance(old, str) or not old:
+            raise FilesystemPluginError(f"input 'old' must be a non-empty string, got {old!r}")
+        if not isinstance(new, str):
+            # Empty `new` is valid — it deletes the matched text.
+            raise FilesystemPluginError(f"input 'new' must be a string, got {new!r}")
+        if not target.exists():
+            raise FilesystemPluginError(f'no such path: {target}')
+        if not target.is_file():
+            raise FilesystemPluginError(f'not a regular file: {target}')
+
+        text = self._read_text(target)
+        occurrences = text.count(old)
+        if occurrences == 0:
+            raise FilesystemPluginError(f'old string not found in {target} (nothing replaced)')
+        if occurrences > 1:
+            raise FilesystemPluginError(
+                f'old string occurs {occurrences} times in {target}; it must match exactly once — include more surrounding context to make it unique',
+            )
+        self._atomic_write(target, text.replace(old, new, 1))
+        return {'path': str(target), 'replaced': 1}
 
 
 def _non_negative_int(value: object, key: str, *, default: int) -> int:

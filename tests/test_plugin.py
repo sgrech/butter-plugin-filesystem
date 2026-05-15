@@ -197,6 +197,101 @@ async def test_read_file_rejects_invalid_limit(tmp_path: Path, bad: object) -> N
         await plugin.execute('read_file', {'path': str(f), 'limit': bad}, FakePluginContext())
 
 
+# --- write_file --------------------------------------------------------------
+
+
+async def test_write_file_creates_new_file(tmp_path: Path) -> None:
+    plugin = FilesystemPlugin()
+    target = tmp_path / 'new.txt'
+    result = await plugin.execute('write_file', {'path': str(target), 'content': 'héllo'}, FakePluginContext())
+    assert target.read_text(encoding='utf-8') == 'héllo'
+    assert result == {'path': str(target.resolve()), 'bytes_written': len('héllo'.encode())}
+
+
+async def test_write_file_overwrites_atomically(tmp_path: Path) -> None:
+    target = tmp_path / 'a.txt'
+    target.write_text('old contents')
+    plugin = FilesystemPlugin()
+    await plugin.execute('write_file', {'path': str(target), 'content': 'new'}, FakePluginContext())
+    assert target.read_text() == 'new'
+    # No stray temp files left behind.
+    assert [p.name for p in tmp_path.iterdir()] == ['a.txt']
+
+
+async def test_write_file_refuses_directory(tmp_path: Path) -> None:
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='is a directory'):
+        await plugin.execute('write_file', {'path': str(tmp_path), 'content': 'x'}, FakePluginContext())
+
+
+async def test_write_file_refuses_missing_parent(tmp_path: Path) -> None:
+    plugin = FilesystemPlugin()
+    target = tmp_path / 'no' / 'such' / 'f.txt'
+    with pytest.raises(FilesystemPluginError, match='parent directory does not exist'):
+        await plugin.execute('write_file', {'path': str(target), 'content': 'x'}, FakePluginContext())
+
+
+@pytest.mark.parametrize('bad', [None, 123, ['x']])
+async def test_write_file_rejects_non_string_content(tmp_path: Path, bad: object) -> None:
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match="'content' must be a string"):
+        await plugin.execute('write_file', {'path': str(tmp_path / 'a.txt'), 'content': bad}, FakePluginContext())
+
+
+# --- edit_file ---------------------------------------------------------------
+
+
+async def test_edit_file_replaces_unique_occurrence(tmp_path: Path) -> None:
+    target = tmp_path / 'a.txt'
+    target.write_text('alpha beta gamma')
+    plugin = FilesystemPlugin()
+    result = await plugin.execute('edit_file', {'path': str(target), 'old': 'beta', 'new': 'BETA'}, FakePluginContext())
+    assert target.read_text() == 'alpha BETA gamma'
+    assert result == {'path': str(target.resolve()), 'replaced': 1}
+
+
+async def test_edit_file_empty_new_deletes_text(tmp_path: Path) -> None:
+    target = tmp_path / 'a.txt'
+    target.write_text('keep DROP keep')
+    plugin = FilesystemPlugin()
+    await plugin.execute('edit_file', {'path': str(target), 'old': ' DROP', 'new': ''}, FakePluginContext())
+    assert target.read_text() == 'keep keep'
+
+
+async def test_edit_file_absent_old_raises(tmp_path: Path) -> None:
+    target = tmp_path / 'a.txt'
+    target.write_text('nothing here')
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='old string not found'):
+        await plugin.execute('edit_file', {'path': str(target), 'old': 'missing', 'new': 'x'}, FakePluginContext())
+
+
+async def test_edit_file_ambiguous_old_raises_and_leaves_file_untouched(tmp_path: Path) -> None:
+    target = tmp_path / 'a.txt'
+    target.write_text('x x x')
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='occurs 3 times'):
+        await plugin.execute('edit_file', {'path': str(target), 'old': 'x', 'new': 'y'}, FakePluginContext())
+    assert target.read_text() == 'x x x'
+
+
+async def test_edit_file_rejects_binary(tmp_path: Path) -> None:
+    target = tmp_path / 'b.bin'
+    target.write_bytes(b'\xff\xfe\x00')
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match='not a UTF-8 text file'):
+        await plugin.execute('edit_file', {'path': str(target), 'old': 'a', 'new': 'b'}, FakePluginContext())
+
+
+@pytest.mark.parametrize('bad', ['', None, 7])
+async def test_edit_file_rejects_invalid_old(tmp_path: Path, bad: object) -> None:
+    target = tmp_path / 'a.txt'
+    target.write_text('content')
+    plugin = FilesystemPlugin()
+    with pytest.raises(FilesystemPluginError, match="'old' must be a non-empty string"):
+        await plugin.execute('edit_file', {'path': str(target), 'old': bad, 'new': 'x'}, FakePluginContext())
+
+
 # --- dispatch ----------------------------------------------------------------
 
 
@@ -214,7 +309,7 @@ def test_manifest_round_trips_through_butter_validator() -> None:
     assert manifest.name == 'filesystem'
     assert manifest.blast_radius is BlastRadius.LOCAL_WRITE
     assert manifest.entrypoint == 'butter_plugin_filesystem:FilesystemPlugin'
-    assert {cap.name for cap in manifest.capabilities} == {'pwd', 'cd', 'list_dir', 'stat', 'read_file'}
+    assert {cap.name for cap in manifest.capabilities} == {'pwd', 'cd', 'list_dir', 'stat', 'read_file', 'write_file', 'edit_file'}
     # All user-facing — they appear in the planner menu.
     assert all(not cap.internal for cap in manifest.capabilities)
     # Filesystem-backed, not database-backed: it calls no other plugin.
