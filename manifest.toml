@@ -1,0 +1,62 @@
+# Plugin manifest consumed by butter-agent at startup.
+#
+# Required keys:
+# - [plugin].name: stable identifier the agent uses to reference this
+#   plugin in task plans. Must be unique across loaded plugins.
+# - [plugin].version: semver string for diagnostics and version pinning.
+# - [plugin].entrypoint: `module:Class` import path resolving to a class
+#   implementing the `Plugin` Protocol (`butter_agent.plugin_api.Plugin`).
+# - [plugin].blast_radius: one of "read-only", "local-write", "network".
+#   The host's `core.max_blast_radius` rejects anything broader. The
+#   filesystem plugin writes, edits, and (when the operator enables it)
+#   deletes files on local disk, so the *plugin* is "local-write" — the
+#   tier covers its most destructive capability; read/navigate/search
+#   ride under the same declared radius (blast_radius is plugin-level).
+# - [[capability]]: at least one entry. Each declares a name, a
+#   one-sentence description (surfaced to the model), and JSON-schema-ish
+#   input/output shapes. Only keys in input_schema are *required* by the
+#   task executor — optional inputs (e.g. `offset`, `limit`) are accepted
+#   but deliberately omitted from the schema so they stay optional.
+#
+# No `requires`: this plugin is filesystem-backed, not database-backed.
+# It never calls another plugin via PluginContext.call. Destructive
+# capabilities (write/edit/delete) are gated by the planner per step
+# (the manifest carries no gate — gate is a plan concern enforced by the
+# host's core) and, for `delete`, additionally by an operator config flag
+# read via PluginContext.config (see README "Delete safety").
+
+[plugin]
+name = "filesystem"
+version = "0.1.0"
+entrypoint = "butter_plugin_filesystem:FilesystemPlugin"
+blast_radius = "local-write"
+
+[[capability]]
+name = "pwd"
+description = "Report the plugin's current working directory (the base relative paths resolve against)."
+input_schema = {}
+output_schema = { cwd = "string" }
+
+[[capability]]
+name = "cd"
+description = "Change the current working directory to `path` (absolute, or relative to the current cwd; `~` is expanded). Fails if the target does not exist or is not a directory."
+input_schema = { path = "string" }
+output_schema = { cwd = "string" }
+
+[[capability]]
+name = "list_dir"
+description = "List the entries of a directory — optional `path` (absolute or relative to cwd; defaults to the current cwd). Each entry reports its name, type (file/dir/symlink/other), and size in bytes."
+input_schema = {}
+output_schema = { path = "string", entries = "array" }
+
+[[capability]]
+name = "stat"
+description = "Report metadata for one filesystem path: its resolved absolute path, type (file/dir/symlink/other), size in bytes, and last-modified time (ISO-8601)."
+input_schema = { path = "string" }
+output_schema = { path = "string", type = "string", size = "integer", mtime = "string" }
+
+[[capability]]
+name = "read_file"
+description = "Read a UTF-8 text file at `path` (absolute or relative to cwd). Optional `offset` (0-based start line) and `limit` (max lines) read a slice of large files. Reports whether the returned content was truncated. Fails on a non-UTF-8 (binary) file."
+input_schema = { path = "string" }
+output_schema = { path = "string", content = "string", lines = "integer", truncated = "boolean" }

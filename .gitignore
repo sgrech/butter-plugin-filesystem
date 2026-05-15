@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[codz]
+*.egg-info/
+
+# Distribution
+build/
+dist/
+
+# Environments
+.venv
+.env
+.envrc
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Per-session Claude Code debrief — local only.
+.claude/next-session.md
